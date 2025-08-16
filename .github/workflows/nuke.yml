@@ -6,7 +6,7 @@ on:
       top_n:
         description: Top hosts to aggressively scan
         required: true
-        default: "300"
+        default: "150"
       chunks:
         description: Parallel chunks for aggressive scan
         required: true
@@ -14,11 +14,11 @@ on:
       aggressive:
         description: Enable intrusive vuln templates (only if scope allows)
         required: true
-        default: "false"
+        default: "true"
       httpx_threads:
         description: httpx threads
         required: true
-        default: "300"
+        default: "200"
       nuclei_rate:
         description: nuclei rate-limit
         required: true
@@ -36,9 +36,8 @@ permissions:
   contents: read
 
 env:
-  # safe defaults for aggressive scans; tweak only if you know the impact
-  DEFAULT_TOP_N: "300"
-  DEFAULT_CHUNKS: "6"
+  GOBIN: ${{ runner.home }}/.local/bin
+  TMP_NUCLEI: /tmp/nuclei-templates
 
 jobs:
   prepare:
@@ -48,68 +47,64 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # pin a modern Go (avoid repeated auto-downloads)
-      - name: Setup Go (prepare) - pin 1.24.x
+      - name: Setup Go (pin 1.24.x)
         uses: actions/setup-go@v5
         with:
           go-version: '1.24.6'
-          cache: true
 
-      - name: Install deps (Python + subfinder only)
+      - name: Cache go build & modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+            ${{ env.GOBIN }}
+          key: go-cache-${{ runner.os }}-${{ hashFiles('**/go.sum') || hashFiles('**/*.mod') || 'nohash' }}
+
+      - name: Install deps (Python + subfinder)
         run: |
           set -euxo pipefail
-
-          # system packages
           sudo apt-get update -y || true
           sudo apt-get install -y --no-install-recommends jq curl python3 python3-pip ca-certificates git unzip gcc
-
           pip3 install --user python-dateutil dnspython requests
-
-          # absolute GOBIN at runtime and export to next steps
-          export GOBIN="$HOME/.local/bin"
-          mkdir -p "$GOBIN"
-          echo "$GOBIN" >> "$GITHUB_PATH"
-          export PATH="$GOBIN:$PATH"
-
-          # avoid go checksum DB and add proxy failover
-          go env -w GOSUMDB=off
-          go env -w GOPROXY=https://proxy.golang.org,https://goproxy.io,direct
-
-          # install helper with exponential backoff and fallback marker
+          mkdir -p "${GOBIN}"
+          echo "${GOBIN}" >> $GITHUB_PATH
+          export PATH="${GOBIN}:$PATH"
+          go env -w GOSUMDB=off || true
+          go env -w GOPROXY=https://proxy.golang.org,https://goproxy.io,direct || true
           go_install_retry() {
-            pkg="$1"; tries=6; wait=3
+            pkg="$1"; tries=5; wait=3
             for i in $(seq 1 $tries); do
               echo "install attempt $i -> $pkg"
-              if GOBIN="$GOBIN" go install "$pkg"; then
-                echo "ok: $pkg"
-                return 0
+              if GOBIN="${GOBIN}" go install "$pkg"; then
+                echo "ok: $pkg" && break
               fi
-              echo "failed attempt $i for $pkg; sleeping $wait"
               sleep $wait
               wait=$((wait*2))
             done
-            echo "::error::failed to install $pkg after $tries tries"
-            return 1
           }
-
-          # Only install subfinder in prepare (lighter, needed for discovery)
           command -v subfinder >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
 
-      - name: Discovery (crt.sh + subfinder)
+      - name: Discovery (crt.sh + subfinder per-seed, filtered)
         id: disco
         run: |
           set -euxo pipefail
-          mkdir -p tmp
-          : > tmp/candidates.txt
+          mkdir -p tmp/disco
+          : > tmp/candidates.raw
           while read -r SEED; do
             [ -z "$SEED" ] && continue
-            echo "[crt.sh] $SEED" >&2
+            echo "[crt.sh] querying $SEED" >&2
             curl -fsS "https://crt.sh/?q=%25.$SEED&output=json" \
               | jq -r '.[].name_value' 2>/dev/null \
-              | sed 's/\*\.//g' || true
-            echo "[subfinder] $SEED" >&2
-            subfinder -d "$SEED" -silent || true
-          done < seeds.txt | sed 's#^https\?://##' | cut -d/ -f1 | sed 's/^www\.//' | sort -u > tmp/candidates.txt
+              | sed 's/\*\.//g' > tmp/disco/crt.$SEED.txt || true
+            echo "[subfinder] running for $SEED" >&2
+            subfinder -d "$SEED" -silent > tmp/disco/subfinder.$SEED.txt || true
+            # combine and keep only suffix-matching entries
+            cat tmp/disco/crt.$SEED.txt tmp/disco/subfinder.$SEED.txt \
+              | sed 's#^https\?://##' | cut -d/ -f1 | sed 's/^www\.//' \
+              | awk -v s=".$SEED" 'tolower($0) ~ s"$" {print tolower($0)}' >> tmp/candidates.raw || true
+          done < seeds.txt
+          sort -u tmp/candidates.raw > tmp/candidates.txt || true
           echo "candidates: $(wc -l < tmp/candidates.txt || echo 0)"
 
       - name: Enrich + score → top list
@@ -117,8 +112,8 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p tmp/enrich
-          python3 scripts/enrich_score.py tmp/candidates.txt --top "${{ github.event.inputs.top_n }}" --cap 1500 --workers 35
-          echo "path=tmp/enrich/top_hosts.txt" >> "$GITHUB_OUTPUT"
+          python3 scripts/enrich_score.py tmp/candidates.txt --top "${{ github.event.inputs.top_n }}" --cap 1500 --workers 35 --timeout 4
+          echo "path=tmp/enrich/top_hosts.txt" >> $GITHUB_OUTPUT
 
       - name: Upload enrichment artifacts
         uses: actions/upload-artifact@v4
@@ -135,7 +130,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        chunk: [1]
+        chunk: [1]  # keep single job splitting inside; change to [1,2,3,...] to parallelize across matrix workers
     steps:
       - uses: actions/checkout@v4
 
@@ -143,66 +138,50 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.24.6'
-          cache: true
 
-      - name: Install scan tools (httpx, nuclei, ffuf) - robust
+      - name: Install scan tools (httpx, nuclei, ffuf) robust
         run: |
           set -euxo pipefail
-          export GOBIN="$HOME/.local/bin"
-          mkdir -p "$GOBIN"
-          echo "$GOBIN" >> "$GITHUB_PATH"
-          export PATH="$GOBIN:$PATH"
-
-          # make installs tolerant of sum.golang.org and flaky proxies
-          go env -w GOSUMDB=off
-          go env -w GOPROXY=https://proxy.golang.org,https://goproxy.io,direct
-
+          mkdir -p "${GOBIN}"
+          echo "${GOBIN}" >> $GITHUB_PATH
+          export PATH="${GOBIN}:$PATH"
+          go env -w GOSUMDB=off || true
+          go env -w GOPROXY=https://proxy.golang.org,https://goproxy.io,direct || true
           go_install_retry() {
-            pkg="$1"; tries=6; wait=3
+            pkg="$1"; tries=5; wait=3
             for i in $(seq 1 $tries); do
-              echo "install attempt $i -> $pkg"
-              if GOBIN="$GOBIN" go install "$pkg"; then
-                return 0
-              fi
-              echo "failed; sleeping $wait"
+              if GOBIN="${GOBIN}" go install "$pkg"; then break; fi
               sleep $wait
               wait=$((wait*2))
             done
-            echo "::warning::go install failed for $pkg after $tries attempts"
-            return 1
           }
-
-          # primary installs (idempotent)
           command -v httpx >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/httpx/cmd/httpx@latest
           command -v nuclei >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
           command -v ffuf >/dev/null 2>&1 || (go_install_retry github.com/ffuf/ffuf@latest || true)
-
-          # smoke checks (non-fatal prints)
           httpx -version || echo "httpx not available"
           nuclei -version || echo "nuclei not available"
           ffuf -version || echo "ffuf not available"
 
-      - name: Fetch nuclei templates (robust + zip fallback)
+      - name: Fetch nuclei templates (git then zip fallback)
         run: |
           set -euxo pipefail
-          ulimit -n 65535 || true
-          rm -rf /tmp/nuclei-templates
+          rm -rf "${{ env.TMP_NUCLEI }}"
           for attempt in 1 2 3; do
             echo "[template fetch] attempt $attempt"
-            if git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates /tmp/nuclei-templates; then break; fi
+            if git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates "${{ env.TMP_NUCLEI }}"; then break; fi
             sleep $((attempt*5))
           done
-          if [ ! -d /tmp/nuclei-templates ] || [ -z "$(ls -A /tmp/nuclei-templates 2>/dev/null || true)" ]; then
+          if [ ! -d "${{ env.TMP_NUCLEI }}" ] || [ -z "$(ls -A "${{ env.TMP_NUCLEI }}" 2>/dev/null || true)" ]; then
             echo "[template fetch] zip fallback"
             curl -fsSL https://github.com/projectdiscovery/nuclei-templates/archive/refs/heads/master.zip -o /tmp/nuclei-templates.zip || true
             unzip -q /tmp/nuclei-templates.zip -d /tmp || true
-            [ -d /tmp/nuclei-templates-master ] && mv /tmp/nuclei-templates-master /tmp/nuclei-templates || true
+            [ -d /tmp/nuclei-templates-master ] && mv /tmp/nuclei-templates-master "${{ env.TMP_NUCLEI }}" || true
           fi
-          if [ -d /tmp/nuclei-templates ] && [ -n "$(ls -A /tmp/nuclei-templates 2>/dev/null || true)" ]; then
-            echo "[template fetch] success; files: $(find /tmp/nuclei-templates -type f | wc -l)"
+          if [ -d "${{ env.TMP_NUCLEI }}" ] && [ -n "$(ls -A "${{ env.TMP_NUCLEI }}" 2>/dev/null || true)" ]; then
+            echo "[template fetch] success; templates: $(find "${{ env.TMP_NUCLEI }}" -type f | wc -l)"
             nuclei -update-templates || true
           else
-            echo "::warning::nuclei templates not present after retries — nuclei step will skip templates"
+            echo "::warning:: nuclei templates missing -> scanning will skip templates"
           fi
 
       - name: Download top hosts
@@ -218,11 +197,13 @@ jobs:
           mkdir -p tmp/split
           c=${{ github.event.inputs.chunks }}
           nl=$(wc -l < tmp/enrich/top_hosts.txt || echo 0)
-          [ "$nl" -eq 0 ] && { echo "::warning::No top hosts"; exit 0; }
+          if [ "$nl" -eq 0 ]; then
+            echo "::warning:: No top hosts found; exiting early" && exit 0
+          fi
           split -n l/$c tmp/enrich/top_hosts.txt tmp/split/part.
-          echo "parts=$(ls tmp/split/part.* | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+          echo "parts=$(ls tmp/split/part.* | tr '\n' ' ')" >> $GITHUB_OUTPUT
 
-      - name: Run scans (loop parts)
+      - name: Run scans (loop parts; prefilter + single nuclei)
         env:
           THREADS: ${{ github.event.inputs.httpx_threads }}
           RATE: ${{ github.event.inputs.nuclei_rate }}
@@ -231,7 +212,6 @@ jobs:
           FFUF_WORDLIST: ${{ github.event.inputs.ffuf_wordlist }}
         run: |
           set -euxo pipefail
-          ulimit -n 65535 || true
           mkdir -p outputs tmp/top_live_hosts
           for p in tmp/split/part.*; do
             partname="$(basename "$p")"
@@ -246,30 +226,27 @@ jobs:
             fi
 
             if [ "${DO_DIRFUZZ:-false}" = "true" ] && command -v ffuf >/dev/null 2>&1; then
-              echo "[ffuf] quick dirfuzz on live hosts (capped wordlist)"
-              # safety: enforce capped file size to avoid >6h
               if [ -f "${FFUF_WORDLIST}" ]; then
-                wc -l "${FFUF_WORDLIST}"
+                echo "[ffuf] running (capped wordlist) – only enable for targeted runs"
+                while read -r h; do
+                  ffuf -w "${FFUF_WORDLIST}" -u "https://$h/FUZZ" -mc 200,301 -t 40 -o "outputs/ffuf.$h.$partname.json" || true
+                done < "tmp/top_live_hosts.$partname.txt" || true
               else
-                echo "::warning::ffuf wordlist missing; skipping ffuf"
+                echo "::warning:: ffuf wordlist missing; skipping ffuf"
               fi
-              while read -r h; do
-                ffuf -w "${FFUF_WORDLIST}" -u "https://$h/FUZZ" -mc 200,301 -t 40 -o "outputs/ffuf.$h.$partname.json" || true
-              done < "tmp/top_live_hosts.$partname.txt" || true
             fi
 
-            TEMPLATE_ARGS="-t /tmp/nuclei-templates/takeovers -t /tmp/nuclei-templates/exposures -t /tmp/nuclei-templates/misconfiguration"
+            TEMPLATE_ARGS="-t ${TMP_NUCLEI}/takeovers -t ${TMP_NUCLEI}/exposures -t ${TMP_NUCLEI}/misconfiguration"
             if [ "${AGGR}" = "true" ]; then
-              TEMPLATE_ARGS="$TEMPLATE_ARGS -t /tmp/nuclei-templates/vulnerabilities -t /tmp/nuclei-templates/cves"
+              TEMPLATE_ARGS="${TEMPLATE_ARGS} -t ${TMP_NUCLEI}/vulnerabilities -t ${TMP_NUCLEI}/cves"
             fi
 
             echo "[nuclei] running on live hosts $partname (templates: ${AGGR})"
-            if [ -s "tmp/top_live_hosts.$partname.txt" ] && [ -d /tmp/nuclei-templates ]; then
-              nuclei -l "tmp/top_live_hosts.$partname.txt" $TEMPLATE_ARGS -severity medium,high,critical --rate-limit "$RATE" -jsonl -o "outputs/nuclei.$partname.jsonl" || true
+            if [ -s "tmp/top_live_hosts.$partname.txt" ] && [ -d "${TMP_NUCLEI}" ]; then
+              nuclei -l "tmp/top_live_hosts.$partname.txt" ${TEMPLATE_ARGS} -severity medium,high,critical --rate-limit "${RATE}" -jsonl -o "outputs/nuclei.$partname.jsonl" || true
             else
               echo "no live hosts or templates missing for this chunk"
             fi
-
             sleep 2
           done
 
