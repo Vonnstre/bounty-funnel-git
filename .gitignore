@@ -1,0 +1,7 @@
+# outputs and temporary artifacts
+outputs/
+tmp/
+*.json
+*.jsonl
+*.txt
+*.csv
