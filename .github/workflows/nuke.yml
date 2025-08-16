@@ -36,7 +36,7 @@ permissions:
   contents: read
 
 env:
-  GOBIN: ${{ runner.home }}/.local/bin
+  GOBIN: $HOME/.local/bin
   TMP_NUCLEI: /tmp/nuclei-templates
 
 jobs:
@@ -130,7 +130,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        chunk: [1]  # keep single job splitting inside; change to [1,2,3,...] to parallelize across matrix workers
+        chunk: [1]
     steps:
       - uses: actions/checkout@v4
 
@@ -165,20 +165,20 @@ jobs:
       - name: Fetch nuclei templates (git then zip fallback)
         run: |
           set -euxo pipefail
-          rm -rf "${{ env.TMP_NUCLEI }}"
+          rm -rf "${TMP_NUCLEI}"
           for attempt in 1 2 3; do
             echo "[template fetch] attempt $attempt"
-            if git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates "${{ env.TMP_NUCLEI }}"; then break; fi
+            if git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates "${TMP_NUCLEI}"; then break; fi
             sleep $((attempt*5))
           done
-          if [ ! -d "${{ env.TMP_NUCLEI }}" ] || [ -z "$(ls -A "${{ env.TMP_NUCLEI }}" 2>/dev/null || true)" ]; then
+          if [ ! -d "${TMP_NUCLEI}" ] || [ -z "$(ls -A "${TMP_NUCLEI}" 2>/dev/null || true)" ]; then
             echo "[template fetch] zip fallback"
             curl -fsSL https://github.com/projectdiscovery/nuclei-templates/archive/refs/heads/master.zip -o /tmp/nuclei-templates.zip || true
             unzip -q /tmp/nuclei-templates.zip -d /tmp || true
-            [ -d /tmp/nuclei-templates-master ] && mv /tmp/nuclei-templates-master "${{ env.TMP_NUCLEI }}" || true
+            [ -d /tmp/nuclei-templates-master ] && mv /tmp/nuclei-templates-master "${TMP_NUCLEI}" || true
           fi
-          if [ -d "${{ env.TMP_NUCLEI }}" ] && [ -n "$(ls -A "${{ env.TMP_NUCLEI }}" 2>/dev/null || true)" ]; then
-            echo "[template fetch] success; templates: $(find "${{ env.TMP_NUCLEI }}" -type f | wc -l)"
+          if [ -d "${TMP_NUCLEI}" ] && [ -n "$(ls -A "${TMP_NUCLEI}" 2>/dev/null || true)" ]; then
+            echo "[template fetch] success; templates: $(find "${TMP_NUCLEI}" -type f | wc -l)"
             nuclei -update-templates || true
           else
             echo "::warning:: nuclei templates missing -> scanning will skip templates"
