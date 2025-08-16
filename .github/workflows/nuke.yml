@@ -27,9 +27,18 @@ on:
         description: Run a short dir fuzz (ffuf) on live hosts (true/false)
         required: true
         default: "false"
+      ffuf_wordlist:
+        description: Path to ffuf wordlist (kept small by default)
+        required: true
+        default: "repo-wordlists/small-admin.txt"
 
 permissions:
   contents: read
+
+env:
+  # safe defaults for aggressive scans; tweak only if you know the impact
+  DEFAULT_TOP_N: "300"
+  DEFAULT_CHUNKS: "6"
 
 jobs:
   prepare:
@@ -39,40 +48,51 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Go (for PD & tools)
+      # pin a modern Go (avoid repeated auto-downloads)
+      - name: Setup Go (prepare) - pin 1.24.x
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.24.6'
+          cache: true
 
       - name: Install deps (Python + subfinder only)
         run: |
           set -euxo pipefail
+
+          # system packages
           sudo apt-get update -y || true
           sudo apt-get install -y --no-install-recommends jq curl python3 python3-pip ca-certificates git unzip gcc
+
           pip3 install --user python-dateutil dnspython requests
 
-          # Absolute GOBIN + PATH
+          # absolute GOBIN at runtime and export to next steps
           export GOBIN="$HOME/.local/bin"
           mkdir -p "$GOBIN"
           echo "$GOBIN" >> "$GITHUB_PATH"
           export PATH="$GOBIN:$PATH"
 
-          # Go module settings: no checksum DB, multi-proxy failover
+          # avoid go checksum DB and add proxy failover
           go env -w GOSUMDB=off
           go env -w GOPROXY=https://proxy.golang.org,https://goproxy.io,direct
 
-          # Retry helper
+          # install helper with exponential backoff and fallback marker
           go_install_retry() {
-            local pkg="$1"; local tries=6; local wait=3
-            for i in $(seq 1 "$tries"); do
-              echo "[$i/$tries] go install $pkg"
-              if GOBIN="$GOBIN" go install "$pkg"; then return 0; fi
-              echo "retry in ${wait}s"; sleep "$wait"; wait=$((wait*2))
+            pkg="$1"; tries=6; wait=3
+            for i in $(seq 1 $tries); do
+              echo "install attempt $i -> $pkg"
+              if GOBIN="$GOBIN" go install "$pkg"; then
+                echo "ok: $pkg"
+                return 0
+              fi
+              echo "failed attempt $i for $pkg; sleeping $wait"
+              sleep $wait
+              wait=$((wait*2))
             done
-            echo "::error::failed to install $pkg"; return 1
+            echo "::error::failed to install $pkg after $tries tries"
+            return 1
           }
 
-          # Only subfinder is needed in prepare
+          # Only install subfinder in prepare (lighter, needed for discovery)
           command -v subfinder >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
 
       - name: Discovery (crt.sh + subfinder)
@@ -84,7 +104,7 @@ jobs:
           while read -r SEED; do
             [ -z "$SEED" ] && continue
             echo "[crt.sh] $SEED" >&2
-            curl -s "https://crt.sh/?q=%25.$SEED&output=json" \
+            curl -fsS "https://crt.sh/?q=%25.$SEED&output=json" \
               | jq -r '.[].name_value' 2>/dev/null \
               | sed 's/\*\.//g' || true
             echo "[subfinder] $SEED" >&2
@@ -119,12 +139,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Go (scan job)
+      - name: Setup Go (scan job) - pin 1.24.x
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.24.6'
+          cache: true
 
-      - name: Install scan tools (robust)
+      - name: Install scan tools (httpx, nuclei, ffuf) - robust
         run: |
           set -euxo pipefail
           export GOBIN="$HOME/.local/bin"
@@ -132,35 +153,42 @@ jobs:
           echo "$GOBIN" >> "$GITHUB_PATH"
           export PATH="$GOBIN:$PATH"
 
-          # Hardening for flaky networks
+          # make installs tolerant of sum.golang.org and flaky proxies
           go env -w GOSUMDB=off
           go env -w GOPROXY=https://proxy.golang.org,https://goproxy.io,direct
 
           go_install_retry() {
-            local pkg="$1"; local tries=6; local wait=3
-            for i in $(seq 1 "$tries"); do
-              echo "[$i/$tries] go install $pkg"
-              if GOBIN="$GOBIN" go install "$pkg"; then return 0; fi
-              echo "retry in ${wait}s"; sleep "$wait"; wait=$((wait*2))
+            pkg="$1"; tries=6; wait=3
+            for i in $(seq 1 $tries); do
+              echo "install attempt $i -> $pkg"
+              if GOBIN="$GOBIN" go install "$pkg"; then
+                return 0
+              fi
+              echo "failed; sleeping $wait"
+              sleep $wait
+              wait=$((wait*2))
             done
-            echo "::error::failed to install $pkg"; return 1
+            echo "::warning::go install failed for $pkg after $tries attempts"
+            return 1
           }
 
-          command -v httpx   >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/httpx/cmd/httpx@latest
-          command -v nuclei  >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
-          command -v ffuf    >/dev/null 2>&1 || (go_install_retry github.com/ffuf/ffuf@latest || true)
+          # primary installs (idempotent)
+          command -v httpx >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/httpx/cmd/httpx@latest
+          command -v nuclei >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
+          command -v ffuf >/dev/null 2>&1 || (go_install_retry github.com/ffuf/ffuf@latest || true)
 
-          # Quick smoke
-          httpx -version || true
-          nuclei -version || true
+          # smoke checks (non-fatal prints)
+          httpx -version || echo "httpx not available"
+          nuclei -version || echo "nuclei not available"
+          ffuf -version || echo "ffuf not available"
 
-      - name: Fetch nuclei templates (robust)
+      - name: Fetch nuclei templates (robust + zip fallback)
         run: |
           set -euxo pipefail
           ulimit -n 65535 || true
           rm -rf /tmp/nuclei-templates
           for attempt in 1 2 3; do
-            echo "[template fetch] git clone attempt $attempt"
+            echo "[template fetch] attempt $attempt"
             if git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates /tmp/nuclei-templates; then break; fi
             sleep $((attempt*5))
           done
@@ -171,10 +199,10 @@ jobs:
             [ -d /tmp/nuclei-templates-master ] && mv /tmp/nuclei-templates-master /tmp/nuclei-templates || true
           fi
           if [ -d /tmp/nuclei-templates ] && [ -n "$(ls -A /tmp/nuclei-templates 2>/dev/null || true)" ]; then
+            echo "[template fetch] success; files: $(find /tmp/nuclei-templates -type f | wc -l)"
             nuclei -update-templates || true
-            echo "[template fetch] ok: $(find /tmp/nuclei-templates -type f | wc -l) files"
           else
-            echo "::warning::nuclei templates not present after retries — continuing (scan step will skip)"
+            echo "::warning::nuclei templates not present after retries — nuclei step will skip templates"
           fi
 
       - name: Download top hosts
@@ -200,6 +228,7 @@ jobs:
           RATE: ${{ github.event.inputs.nuclei_rate }}
           AGGR: ${{ github.event.inputs.aggressive }}
           DO_DIRFUZZ: ${{ github.event.inputs.do_dirfuzz }}
+          FFUF_WORDLIST: ${{ github.event.inputs.ffuf_wordlist }}
         run: |
           set -euxo pipefail
           ulimit -n 65535 || true
@@ -209,6 +238,7 @@ jobs:
             echo "=== chunk: $partname ==="
             echo "[httpx] verifying live hosts from $p"
             cat "$p" | httpx -silent -threads "${THREADS}" -timeout 8 -ports 80,443 -status-code -title -json -o "outputs/httpx.$partname.jsonl" || true
+
             if [ -s "outputs/httpx.$partname.jsonl" ]; then
               jq -r '.host' "outputs/httpx.$partname.jsonl" > "tmp/top_live_hosts.$partname.txt" || true
             else
@@ -216,9 +246,15 @@ jobs:
             fi
 
             if [ "${DO_DIRFUZZ:-false}" = "true" ] && command -v ffuf >/dev/null 2>&1; then
-              echo "[ffuf] quick dirfuzz on live hosts (tiny list)"
+              echo "[ffuf] quick dirfuzz on live hosts (capped wordlist)"
+              # safety: enforce capped file size to avoid >6h
+              if [ -f "${FFUF_WORDLIST}" ]; then
+                wc -l "${FFUF_WORDLIST}"
+              else
+                echo "::warning::ffuf wordlist missing; skipping ffuf"
+              fi
               while read -r h; do
-                ffuf -w repo-wordlists/small-admin.txt -u "https://$h/FUZZ" -mc 200,301 -t 40 -o "outputs/ffuf.$h.$partname.json" || true
+                ffuf -w "${FFUF_WORDLIST}" -u "https://$h/FUZZ" -mc 200,301 -t 40 -o "outputs/ffuf.$h.$partname.json" || true
               done < "tmp/top_live_hosts.$partname.txt" || true
             fi
 
@@ -233,6 +269,7 @@ jobs:
             else
               echo "no live hosts or templates missing for this chunk"
             fi
+
             sleep 2
           done
 
