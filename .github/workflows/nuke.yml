@@ -33,6 +33,9 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       top_hosts_path: ${{ steps.top.outputs.path }}
+    env:
+      # Use $HOME here (avoid runner.* expression which fails in some contexts)
+      GOBIN: $HOME/.local/bin
     steps:
       - uses: actions/checkout@v4
 
@@ -47,16 +50,19 @@ jobs:
           sudo apt-get update -y || true
           sudo apt-get install -y --no-install-recommends jq curl python3 python3-pip ca-certificates git unzip gcc
           pip3 install --user python-dateutil dnspython requests
-          export GOBIN="$HOME/.local/bin"; mkdir -p "$GOBIN"; echo "$GOBIN" >> $GITHUB_PATH; export PATH="$GOBIN:$PATH"
-          # install ProjectDiscovery tools (latest via "go install")
+          export GOBIN="$HOME/.local/bin"; mkdir -p "$GOBIN"
+          export PATH="$GOBIN:$PATH"
+          # persist GOBIN to subsequent steps in this job (and later jobs)
+          echo "$GOBIN" >> $GITHUB_PATH
+          # install ProjectDiscovery tools (use go install latest)
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
           go install github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
-          # optional dirfuzz tool
+          # optional dirfuzz
           go install github.com/ffuf/ffuf@latest || true
-          # make sure $GOBIN is in $PATH for following steps
-          echo "GOBIN=$GOBIN"
+          echo "Installed PD tools to $GOBIN"
+
       - name: Discovery (crt.sh + subfinder)
         id: disco
         run: |
@@ -94,11 +100,12 @@ jobs:
     needs: prepare
     runs-on: ubuntu-22.04
     env:
-      GOBIN: ${{ runner.home }}/.local/bin
+      # safe to use $HOME here as well
+      GOBIN: $HOME/.local/bin
     strategy:
       fail-fast: false
       matrix:
-        chunk: [1]   # keep single job but split inside; you can change to array of parts for matrix jobs
+        chunk: [1]   # split inside the job; change to multiple values to run many matrix workers
     steps:
       - uses: actions/checkout@v4
 
@@ -110,11 +117,13 @@ jobs:
       - name: Install scan tools (httpx, nuclei, ffuf fallback)
         run: |
           set -euxo pipefail
-          export GOBIN="${GOBIN:-$HOME/.local/bin}"; mkdir -p "$GOBIN"; export PATH="$GOBIN:$PATH"
+          export GOBIN="${GOBIN:-$HOME/.local/bin}"; mkdir -p "$GOBIN"
+          export PATH="$GOBIN:$PATH"
+          echo "$GOBIN" >> $GITHUB_PATH
+          # install/ensure tools present
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
           go install github.com/ffuf/ffuf@latest || true
-          echo "$GOBIN" >> $GITHUB_PATH
 
       - name: Fetch nuclei templates (robust)
         run: |
@@ -139,7 +148,7 @@ jobs:
             echo "::error::nuclei templates not present after retries"
             exit 1
           fi
-          # ensure nuclei binary has latest template index
+          # try updating templates via nuclei (best-effort)
           nuclei -update-templates || true
           echo "[template fetch] done; templates count: $(find /tmp/nuclei-templates -type f | wc -l)"
 
@@ -181,11 +190,10 @@ jobs:
               cp "$p" tmp/top_live_hosts.$partname.txt || true
             fi
 
-            # optional quick dir fuzz (tiny wordlist) to find admin pages / backups - ENABLE at your risk
+            # optional quick dir fuzz (tiny wordlist)
             if [ "${DO_DIRFUZZ:-false}" = "true" ] && command -v ffuf >/dev/null 2>&1; then
               echo "[ffuf] quick dirfuzz on live hosts (tiny list)"
               while read -r h; do
-                echo "https://$h/FUZZ" > /tmp/ffuf_target.$partname.txt
                 ffuf -w repo-wordlists/small-admin.txt -u "https://$h/FUZZ" -mc 200,301 -t 40 -o outputs/ffuf.$h.$partname.json || true
               done < tmp/top_live_hosts.$partname.txt || true
             fi
@@ -193,19 +201,16 @@ jobs:
             # template selection
             TEMPLATE_ARGS="-t /tmp/nuclei-templates/takeovers -t /tmp/nuclei-templates/exposures -t /tmp/nuclei-templates/misconfiguration"
             if [ "${AGGR}" = "true" ]; then
-              # aggressive: add vulnerability and cves templates (heavy)
               TEMPLATE_ARGS="$TEMPLATE_ARGS -t /tmp/nuclei-templates/vulnerabilities -t /tmp/nuclei-templates/cves"
             fi
 
             echo "[nuclei] running on live hosts $partname (templates: ${AGGR})"
             if [ -s tmp/top_live_hosts.$partname.txt ]; then
-              # run nuclei; conservative JSONL output per part
               nuclei -l tmp/top_live_hosts.$partname.txt $TEMPLATE_ARGS -severity medium,high,critical --rate-limit "$RATE" -jsonl -o outputs/nuclei.$partname.jsonl || true
             else
               echo "no live hosts in this chunk"
             fi
 
-            # small cooldown between chunks to avoid bursts
             sleep 2
           done
 
