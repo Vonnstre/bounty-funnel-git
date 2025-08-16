@@ -1,0 +1,161 @@
+name: Aggressive Bounty Funnel (6h)
+
+on:
+  workflow_dispatch:
+    inputs:
+      top_n:
+        description: Top hosts to aggressively scan
+        required: true
+        default: "300"
+      chunks:
+        description: Parallel chunks for aggressive scan
+        required: true
+        default: "4"
+      aggressive:
+        description: Enable intrusive vuln templates (only if scope allows)
+        required: true
+        default: "false"
+      httpx_threads:
+        description: httpx threads
+        required: true
+        default: "200"
+      nuclei_rate:
+        description: nuclei rate-limit
+        required: true
+        default: "80"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      top_hosts_path: ${{ steps.top.outputs.path }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go (for PD tools)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install deps (Python + PD tools)
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -y || true
+          sudo apt-get install -y --no-install-recommends jq curl python3 python3-pip ca-certificates git gcc
+          pip3 install --user python-dateutil dnspython requests
+          export GOBIN="$HOME/.local/bin"; mkdir -p "$GOBIN"; export PATH="$GOBIN:$PATH"
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+          go install github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
+          echo "$GOBIN" >> $GITHUB_PATH
+
+      - name: Discovery (crt.sh + subfinder)
+        id: disco
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+          : > tmp/candidates.txt
+          while read -r SEED; do
+            [ -z "$SEED" ] && continue
+            echo "[crt.sh] $SEED" >&2
+            curl -s "https://crt.sh/?q=%25.$SEED&output=json" \
+              | jq -r '.[].name_value' 2>/dev/null \
+              | sed 's/\*\.//g' || true
+            echo "[subfinder] $SEED" >&2
+            subfinder -d "$SEED" -silent || true
+          done < seeds.txt | sed 's#^https\?://##' | cut -d/ -f1 | sed 's/^www\.//' | sort -u > tmp/candidates.txt
+          echo "candidates: $(wc -l < tmp/candidates.txt || echo 0)"
+
+      - name: Enrich + score → top list
+        id: top
+        run: |
+          set -euxo pipefail
+          python3 scripts/enrich_score.py tmp/candidates.txt --top "${{ github.event.inputs.top_n }}" --cap 1500 --workers 35
+          echo "path=tmp/enrich/top_hosts.txt" >> $GITHUB_OUTPUT
+
+      - name: Upload enrichment artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: enrichment
+          path: |
+            tmp/enrich/top_hosts.txt
+            tmp/enrich/top.json
+            tmp/enrich/all.json
+
+  scan:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: [1]   # we will split files inside the job; you can expand for more matrix-based parallelism
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go + tools (scan job)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - run: |
+          set -euxo pipefail
+          export GOBIN="$HOME/.local/bin"; mkdir -p "$GOBIN"; export PATH="$GOBIN:$PATH"
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
+          git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates /tmp/nuclei-templates || true
+
+      - name: Download top hosts
+        uses: actions/download-artifact@v4
+        with:
+          name: enrichment
+          path: tmp/enrich
+
+      - name: Split into chunks
+        id: split
+        run: |
+          set -euxo pipefail
+          mkdir -p tmp/split
+          c=${{ github.event.inputs.chunks }}
+          nl=$(wc -l < tmp/enrich/top_hosts.txt)
+          [ "$nl" -eq 0 ] && { echo "::warning::No top hosts"; exit 0; }
+          split -n l/$c tmp/enrich/top_hosts.txt tmp/split/part.
+          echo "parts=$(ls tmp/split/part.* | tr '\n' ' ')" >> $GITHUB_OUTPUT
+
+      - name: Run scans (loop parts)
+        env:
+          THREADS: ${{ github.event.inputs.httpx_threads }}
+          RATE: ${{ github.event.inputs.nuclei_rate }}
+          AGGR: ${{ github.event.inputs.aggressive }}
+        run: |
+          set -euxo pipefail
+          mkdir -p outputs
+          for p in tmp/split/part.*; do
+            echo "[httpx] $p"
+            cat "$p" | httpx -silent -threads "$THREADS" -timeout 8 -ports 80,443 -status-code -title -json -o outputs/httpx.$(basename $p).jsonl || true
+            # build live hosts list from httpx JSONL
+            if [ -s outputs/httpx.$(basename $p).jsonl ]; then
+              jq -r '.host' outputs/httpx.$(basename $p).jsonl > tmp/top_live_hosts.$(basename $p).txt || true
+            else
+              # if httpx returned nothing, fallback to original chunk
+              cp "$p" tmp/top_live_hosts.$(basename $p).txt || true
+            fi
+
+            # choose templates based on AGGR
+            TEMPLATE_ARGS="-t /tmp/nuclei-templates/takeovers -t /tmp/nuclei-templates/exposures -t /tmp/nuclei-templates/misconfiguration"
+            if [ "$AGGR" = "true" ]; then
+              TEMPLATE_ARGS="$TEMPLATE_ARGS -t /tmp/nuclei-templates/vulnerabilities"
+            fi
+
+            echo "[nuclei] running on live hosts $p"
+            if [ -s tmp/top_live_hosts.$(basename $p).txt ]; then
+              nuclei -l tmp/top_live_hosts.$(basename $p).txt $TEMPLATE_ARGS -severity medium,high,critical --rate-limit "$RATE" -jsonl -o outputs/nuclei.$(basename $p).jsonl || true
+            else
+              echo "no live hosts in this chunk"
+            fi
+          done
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: findings
+          path: outputs/**
