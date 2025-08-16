@@ -10,7 +10,7 @@ on:
       chunks:
         description: Parallel chunks for aggressive scan
         required: true
-        default: "4"
+        default: "6"
       aggressive:
         description: Enable intrusive vuln templates (only if scope allows)
         required: true
@@ -44,47 +44,36 @@ jobs:
         with:
           go-version: '1.22'
 
-      - name: Check go.sum exists
-        id: check_go_sum
-        run: |
-          if [ -f go.sum ]; then echo "exists=true" >>"$GITHUB_OUTPUT"; else echo "exists=false" >>"$GITHUB_OUTPUT"; fi
-
-      - name: Cache Go modules (only if go.sum present)
-        if: steps.check_go_sum.outputs.exists == 'true'
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
-      - name: Install deps (Python + PD tools)
+      - name: Install deps (Python + subfinder only)
         run: |
           set -euxo pipefail
           sudo apt-get update -y || true
           sudo apt-get install -y --no-install-recommends jq curl python3 python3-pip ca-certificates git unzip gcc
           pip3 install --user python-dateutil dnspython requests
 
-          # set absolute GOBIN at runtime (do NOT rely on job-level env)
+          # Absolute GOBIN + PATH
           export GOBIN="$HOME/.local/bin"
           mkdir -p "$GOBIN"
           echo "$GOBIN" >> "$GITHUB_PATH"
           export PATH="$GOBIN:$PATH"
 
-          # ensure go proxy for stable downloads
-          go env -w GOPROXY=https://proxy.golang.org,direct
+          # Go module settings: no checksum DB, multi-proxy failover
+          go env -w GOSUMDB=off
+          go env -w GOPROXY=https://proxy.golang.org,https://goproxy.io,direct
 
-          # install PD tools (idempotent: only install if missing or force)
-          if ! command -v subfinder >/dev/null 2>&1; then GOBIN="$GOBIN" go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest; fi
-          if ! command -v httpx >/dev/null 2>&1; then GOBIN="$GOBIN" go install github.com/projectdiscovery/httpx/cmd/httpx@latest; fi
-          if ! command -v dnsx >/dev/null 2>&1; then GOBIN="$GOBIN" go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest; fi
-          if ! command -v nuclei >/dev/null 2>&1; then GOBIN="$GOBIN" go install github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest; fi
-          # ffuf optional
-          if ! command -v ffuf >/dev/null 2>&1; then GOBIN="$GOBIN" go install github.com/ffuf/ffuf@latest || true; fi
+          # Retry helper
+          go_install_retry() {
+            local pkg="$1"; local tries=6; local wait=3
+            for i in $(seq 1 "$tries"); do
+              echo "[$i/$tries] go install $pkg"
+              if GOBIN="$GOBIN" go install "$pkg"; then return 0; fi
+              echo "retry in ${wait}s"; sleep "$wait"; wait=$((wait*2))
+            done
+            echo "::error::failed to install $pkg"; return 1
+          }
 
-          echo "Installed tools to $GOBIN"
+          # Only subfinder is needed in prepare
+          command -v subfinder >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
 
       - name: Discovery (crt.sh + subfinder)
         id: disco
@@ -109,7 +98,7 @@ jobs:
           set -euxo pipefail
           mkdir -p tmp/enrich
           python3 scripts/enrich_score.py tmp/candidates.txt --top "${{ github.event.inputs.top_n }}" --cap 1500 --workers 35
-          echo "path=tmp/enrich/top_hosts.txt" >> $GITHUB_OUTPUT
+          echo "path=tmp/enrich/top_hosts.txt" >> "$GITHUB_OUTPUT"
 
       - name: Upload enrichment artifacts
         uses: actions/upload-artifact@v4
@@ -135,44 +124,57 @@ jobs:
         with:
           go-version: '1.22'
 
-      - name: Install scan tools (httpx, nuclei, ffuf fallback)
+      - name: Install scan tools (robust)
         run: |
           set -euxo pipefail
-          # set absolute GOBIN at runtime
           export GOBIN="$HOME/.local/bin"
           mkdir -p "$GOBIN"
           echo "$GOBIN" >> "$GITHUB_PATH"
           export PATH="$GOBIN:$PATH"
 
-          # idempotent installs (install only if missing)
-          command -v httpx >/dev/null 2>&1 || GOBIN="$GOBIN" go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-          command -v nuclei >/dev/null 2>&1 || GOBIN="$GOBIN" go install github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
-          command -v ffuf >/dev/null 2>&1 || GOBIN="$GOBIN" go install github.com/ffuf/ffuf@latest || true
+          # Hardening for flaky networks
+          go env -w GOSUMDB=off
+          go env -w GOPROXY=https://proxy.golang.org,https://goproxy.io,direct
+
+          go_install_retry() {
+            local pkg="$1"; local tries=6; local wait=3
+            for i in $(seq 1 "$tries"); do
+              echo "[$i/$tries] go install $pkg"
+              if GOBIN="$GOBIN" go install "$pkg"; then return 0; fi
+              echo "retry in ${wait}s"; sleep "$wait"; wait=$((wait*2))
+            done
+            echo "::error::failed to install $pkg"; return 1
+          }
+
+          command -v httpx   >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/httpx/cmd/httpx@latest
+          command -v nuclei  >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
+          command -v ffuf    >/dev/null 2>&1 || (go_install_retry github.com/ffuf/ffuf@latest || true)
+
+          # Quick smoke
+          httpx -version || true
+          nuclei -version || true
 
       - name: Fetch nuclei templates (robust)
         run: |
           set -euxo pipefail
+          ulimit -n 65535 || true
           rm -rf /tmp/nuclei-templates
-          ATTEMPTS=0
-          until [ -d /tmp/nuclei-templates ] && [ -n "$(ls -A /tmp/nuclei-templates 2>/dev/null || true)" ] || [ $ATTEMPTS -ge 3 ]; do
-            ATTEMPTS=$((ATTEMPTS+1))
-            echo "[template fetch] attempt $ATTEMPTS"
-            git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates /tmp/nuclei-templates && break || true
-            sleep 5
+          for attempt in 1 2 3; do
+            echo "[template fetch] git clone attempt $attempt"
+            if git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates /tmp/nuclei-templates; then break; fi
+            sleep $((attempt*5))
           done
           if [ ! -d /tmp/nuclei-templates ] || [ -z "$(ls -A /tmp/nuclei-templates 2>/dev/null || true)" ]; then
-            echo "[template fetch] git clone failed, trying zip fallback"
-            curl -sL https://github.com/projectdiscovery/nuclei-templates/archive/refs/heads/master.zip -o /tmp/nuclei-templates.zip || true
+            echo "[template fetch] zip fallback"
+            curl -fsSL https://github.com/projectdiscovery/nuclei-templates/archive/refs/heads/master.zip -o /tmp/nuclei-templates.zip || true
             unzip -q /tmp/nuclei-templates.zip -d /tmp || true
-            if [ -d /tmp/nuclei-templates-master ]; then
-              mv /tmp/nuclei-templates-master /tmp/nuclei-templates || true
-            fi
+            [ -d /tmp/nuclei-templates-master ] && mv /tmp/nuclei-templates-master /tmp/nuclei-templates || true
           fi
-          if [ ! -d /tmp/nuclei-templates ] || [ -z "$(ls -A /tmp/nuclei-templates 2>/dev/null || true)" ]; then
-            echo "::warning::nuclei templates not present after retries — continuing but templates missing"
-          else
+          if [ -d /tmp/nuclei-templates ] && [ -n "$(ls -A /tmp/nuclei-templates 2>/dev/null || true)" ]; then
             nuclei -update-templates || true
-            echo "[template fetch] done; templates count: $(find /tmp/nuclei-templates -type f | wc -l)"
+            echo "[template fetch] ok: $(find /tmp/nuclei-templates -type f | wc -l) files"
+          else
+            echo "::warning::nuclei templates not present after retries — continuing (scan step will skip)"
           fi
 
       - name: Download top hosts
@@ -190,7 +192,7 @@ jobs:
           nl=$(wc -l < tmp/enrich/top_hosts.txt || echo 0)
           [ "$nl" -eq 0 ] && { echo "::warning::No top hosts"; exit 0; }
           split -n l/$c tmp/enrich/top_hosts.txt tmp/split/part.
-          echo "parts=$(ls tmp/split/part.* | tr '\n' ' ')" >> $GITHUB_OUTPUT
+          echo "parts=$(ls tmp/split/part.* | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
 
       - name: Run scans (loop parts)
         env:
@@ -200,22 +202,24 @@ jobs:
           DO_DIRFUZZ: ${{ github.event.inputs.do_dirfuzz }}
         run: |
           set -euxo pipefail
+          ulimit -n 65535 || true
           mkdir -p outputs tmp/top_live_hosts
           for p in tmp/split/part.*; do
             partname="$(basename "$p")"
             echo "=== chunk: $partname ==="
             echo "[httpx] verifying live hosts from $p"
-            cat "$p" | httpx -silent -threads "${THREADS}" -timeout 8 -ports 80,443 -status-code -title -json -o outputs/httpx.$partname.jsonl || true
-            if [ -s outputs/httpx.$partname.jsonl ]; then
-              jq -r '.host' outputs/httpx.$partname.jsonl > tmp/top_live_hosts.$partname.txt || true
+            cat "$p" | httpx -silent -threads "${THREADS}" -timeout 8 -ports 80,443 -status-code -title -json -o "outputs/httpx.$partname.jsonl" || true
+            if [ -s "outputs/httpx.$partname.jsonl" ]; then
+              jq -r '.host' "outputs/httpx.$partname.jsonl" > "tmp/top_live_hosts.$partname.txt" || true
             else
-              cp "$p" tmp/top_live_hosts.$partname.txt || true
+              cp "$p" "tmp/top_live_hosts.$partname.txt" || true
             fi
+
             if [ "${DO_DIRFUZZ:-false}" = "true" ] && command -v ffuf >/dev/null 2>&1; then
               echo "[ffuf] quick dirfuzz on live hosts (tiny list)"
               while read -r h; do
                 ffuf -w repo-wordlists/small-admin.txt -u "https://$h/FUZZ" -mc 200,301 -t 40 -o "outputs/ffuf.$h.$partname.json" || true
-              done < tmp/top_live_hosts.$partname.txt || true
+              done < "tmp/top_live_hosts.$partname.txt" || true
             fi
 
             TEMPLATE_ARGS="-t /tmp/nuclei-templates/takeovers -t /tmp/nuclei-templates/exposures -t /tmp/nuclei-templates/misconfiguration"
@@ -224,8 +228,8 @@ jobs:
             fi
 
             echo "[nuclei] running on live hosts $partname (templates: ${AGGR})"
-            if [ -s tmp/top_live_hosts.$partname.txt ] && [ -d /tmp/nuclei-templates ]; then
-              nuclei -l tmp/top_live_hosts.$partname.txt $TEMPLATE_ARGS -severity medium,high,critical --rate-limit "$RATE" -jsonl -o outputs/nuclei.$partname.jsonl || true
+            if [ -s "tmp/top_live_hosts.$partname.txt" ] && [ -d /tmp/nuclei-templates ]; then
+              nuclei -l "tmp/top_live_hosts.$partname.txt" $TEMPLATE_ARGS -severity medium,high,critical --rate-limit "$RATE" -jsonl -o "outputs/nuclei.$partname.jsonl" || true
             else
               echo "no live hosts or templates missing for this chunk"
             fi
