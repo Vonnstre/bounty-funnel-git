@@ -200,7 +200,8 @@ jobs:
           }
 
           command -v httpx >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/httpx/cmd/httpx@latest
-          command -v nuclei >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
+          # FIXED: install nuclei v3 (old v2 path caused v2.9.15 to be installed)
+          command -v nuclei >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
           command -v ffuf >/dev/null 2>&1 || (go_install_retry github.com/ffuf/ffuf@latest || true)
 
           # smoke checks
@@ -281,9 +282,10 @@ jobs:
               fi
             fi
 
-            TEMPLATE_ARGS="-t ${TMP_NUCLEI}/takeovers -t ${TMP_NUCLEI}/exposures -t ${TMP_NUCLEI}/misconfiguration"
+            # FIXED: point to the repository's protocol subfolders (http/...) not root
+            TEMPLATE_ARGS="-t ${TMP_NUCLEI}/http/takeovers -t ${TMP_NUCLEI}/http/exposures -t ${TMP_NUCLEI}/http/misconfiguration"
             if [ "${AGGR}" = "true" ]; then
-              TEMPLATE_ARGS="${TEMPLATE_ARGS} -t ${TMP_NUCLEI}/vulnerabilities -t ${TMP_NUCLEI}/cves"
+              TEMPLATE_ARGS="${TEMPLATE_ARGS} -t ${TMP_NUCLEI}/http/vulnerabilities -t ${TMP_NUCLEI}/http/cves"
             fi
 
             echo "[nuclei] running on live hosts $partname (templates: ${AGGR})"
