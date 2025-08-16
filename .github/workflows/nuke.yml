@@ -36,7 +36,9 @@ permissions:
   contents: read
 
 env:
-  GOBIN: $HOME/.local/bin
+  # Use an absolute GOBIN so `go install` never fails with "must be an absolute path".
+  # /home/runner is the homedir used on GitHub-hosted ubuntu runners.
+  GOBIN: /home/runner/.local/bin
   TMP_NUCLEI: /tmp/nuclei-templates
 
 jobs:
@@ -64,26 +66,55 @@ jobs:
       - name: Install deps (Python + subfinder)
         run: |
           set -euxo pipefail
+
+          # system packages
           sudo apt-get update -y || true
           sudo apt-get install -y --no-install-recommends jq curl python3 python3-pip ca-certificates git unzip gcc
+
+          # python deps
           pip3 install --user python-dateutil dnspython requests
+
+          # ensure GOBIN exists (absolute path from env)
           mkdir -p "${GOBIN}"
-          echo "${GOBIN}" >> $GITHUB_PATH
+          echo "${GOBIN}" >> "$GITHUB_PATH"
           export PATH="${GOBIN}:$PATH"
+
+          # tolerate go checks / flaky proxy
           go env -w GOSUMDB=off || true
           go env -w GOPROXY=https://proxy.golang.org,https://goproxy.io,direct || true
+
+          # robust go installer (exponential backoff)
           go_install_retry() {
-            pkg="$1"; tries=5; wait=3
+            pkg="$1"; tries=6; wait=3
             for i in $(seq 1 $tries); do
               echo "install attempt $i -> $pkg"
               if GOBIN="${GOBIN}" go install "$pkg"; then
-                echo "ok: $pkg" && break
+                echo "ok: $pkg"
+                return 0
               fi
+              echo "failed attempt $i for $pkg; sleeping $wait"
               sleep $wait
               wait=$((wait*2))
             done
+            echo "::error::failed to install $pkg after $tries tries"
+            return 1
           }
-          command -v subfinder >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+
+          # install subfinder (required for discovery)
+          if ! command -v subfinder >/dev/null 2>&1; then
+            go_install_retry github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          fi
+
+          # fail early and loudly if subfinder still missing (helps debugging)
+          if ! command -v subfinder >/dev/null 2>&1; then
+            echo "::error::subfinder not found after install (GOBIN=${GOBIN})"
+            ls -la "${GOBIN}" || true
+            env | grep -E 'GOBIN|PATH' || true
+            exit 1
+          fi
+
+          # show version (non-fatal) for verification
+          subfinder -version || subfinder -h || true
 
       - name: Discovery (crt.sh + subfinder per-seed, filtered)
         id: disco
@@ -98,6 +129,7 @@ jobs:
               | jq -r '.[].name_value' 2>/dev/null \
               | sed 's/\*\.//g' > tmp/disco/crt.$SEED.txt || true
             echo "[subfinder] running for $SEED" >&2
+            # safeguard: if subfinder missing, the command will exit non-fatally because of "|| true"
             subfinder -d "$SEED" -silent > tmp/disco/subfinder.$SEED.txt || true
             # combine and keep only suffix-matching entries
             cat tmp/disco/crt.$SEED.txt tmp/disco/subfinder.$SEED.txt \
@@ -142,22 +174,36 @@ jobs:
       - name: Install scan tools (httpx, nuclei, ffuf) robust
         run: |
           set -euxo pipefail
+          # ensure GOBIN available and exposed to PATH
           mkdir -p "${GOBIN}"
-          echo "${GOBIN}" >> $GITHUB_PATH
+          echo "${GOBIN}" >> "$GITHUB_PATH"
           export PATH="${GOBIN}:$PATH"
+
+          # tolerant go config
           go env -w GOSUMDB=off || true
           go env -w GOPROXY=https://proxy.golang.org,https://goproxy.io,direct || true
+
           go_install_retry() {
-            pkg="$1"; tries=5; wait=3
+            pkg="$1"; tries=6; wait=3
             for i in $(seq 1 $tries); do
-              if GOBIN="${GOBIN}" go install "$pkg"; then break; fi
+              echo "install attempt $i -> $pkg"
+              if GOBIN="${GOBIN}" go install "$pkg"; then
+                echo "ok: $pkg"
+                return 0
+              fi
+              echo "failed; sleeping $wait"
               sleep $wait
               wait=$((wait*2))
             done
+            echo "::warning::go install failed for $pkg after $tries attempts"
+            return 1
           }
+
           command -v httpx >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/httpx/cmd/httpx@latest
           command -v nuclei >/dev/null 2>&1 || go_install_retry github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
           command -v ffuf >/dev/null 2>&1 || (go_install_retry github.com/ffuf/ffuf@latest || true)
+
+          # smoke checks
           httpx -version || echo "httpx not available"
           nuclei -version || echo "nuclei not available"
           ffuf -version || echo "ffuf not available"
@@ -218,7 +264,6 @@ jobs:
             echo "=== chunk: $partname ==="
             echo "[httpx] verifying live hosts from $p"
             cat "$p" | httpx -silent -threads "${THREADS}" -timeout 8 -ports 80,443 -status-code -title -json -o "outputs/httpx.$partname.jsonl" || true
-
             if [ -s "outputs/httpx.$partname.jsonl" ]; then
               jq -r '.host' "outputs/httpx.$partname.jsonl" > "tmp/top_live_hosts.$partname.txt" || true
             else
