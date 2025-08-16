@@ -18,11 +18,15 @@ on:
       httpx_threads:
         description: httpx threads
         required: true
-        default: "200"
+        default: "300"
       nuclei_rate:
         description: nuclei rate-limit
         required: true
-        default: "80"
+        default: "120"
+      do_dirfuzz:
+        description: Run a short dir fuzz (ffuf) on live hosts (true/false)
+        required: true
+        default: "false"
 
 jobs:
   prepare:
@@ -32,7 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Go (for PD tools)
+      - name: Setup Go (for PD & tools)
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
@@ -41,15 +45,18 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update -y || true
-          sudo apt-get install -y --no-install-recommends jq curl python3 python3-pip ca-certificates git gcc
+          sudo apt-get install -y --no-install-recommends jq curl python3 python3-pip ca-certificates git unzip gcc
           pip3 install --user python-dateutil dnspython requests
-          export GOBIN="$HOME/.local/bin"; mkdir -p "$GOBIN"; export PATH="$GOBIN:$PATH"
+          export GOBIN="$HOME/.local/bin"; mkdir -p "$GOBIN"; echo "$GOBIN" >> $GITHUB_PATH; export PATH="$GOBIN:$PATH"
+          # install ProjectDiscovery tools (latest via "go install")
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
           go install github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
-          echo "$GOBIN" >> $GITHUB_PATH
-
+          # optional dirfuzz tool
+          go install github.com/ffuf/ffuf@latest || true
+          # make sure $GOBIN is in $PATH for following steps
+          echo "GOBIN=$GOBIN"
       - name: Discovery (crt.sh + subfinder)
         id: disco
         run: |
@@ -86,23 +93,55 @@ jobs:
   scan:
     needs: prepare
     runs-on: ubuntu-22.04
+    env:
+      GOBIN: ${{ runner.home }}/.local/bin
     strategy:
       fail-fast: false
       matrix:
-        chunk: [1]   # we will split files inside the job; you can expand for more matrix-based parallelism
+        chunk: [1]   # keep single job but split inside; you can change to array of parts for matrix jobs
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Go + tools (scan job)
+      - name: Setup Go tools (scan job)
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-      - run: |
+
+      - name: Install scan tools (httpx, nuclei, ffuf fallback)
+        run: |
           set -euxo pipefail
-          export GOBIN="$HOME/.local/bin"; mkdir -p "$GOBIN"; export PATH="$GOBIN:$PATH"
+          export GOBIN="${GOBIN:-$HOME/.local/bin}"; mkdir -p "$GOBIN"; export PATH="$GOBIN:$PATH"
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
-          git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates /tmp/nuclei-templates || true
+          go install github.com/ffuf/ffuf@latest || true
+          echo "$GOBIN" >> $GITHUB_PATH
+
+      - name: Fetch nuclei templates (robust)
+        run: |
+          set -euxo pipefail
+          rm -rf /tmp/nuclei-templates
+          ATTEMPTS=0
+          until [ -d /tmp/nuclei-templates ] && [ -n "$(ls -A /tmp/nuclei-templates 2>/dev/null || true)" ] || [ $ATTEMPTS -ge 3 ]; do
+            ATTEMPTS=$((ATTEMPTS+1))
+            echo "[template fetch] attempt $ATTEMPTS"
+            git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates /tmp/nuclei-templates && break || true
+            sleep 5
+          done
+          if [ ! -d /tmp/nuclei-templates ] || [ -z "$(ls -A /tmp/nuclei-templates 2>/dev/null || true)" ]; then
+            echo "[template fetch] git clone failed, trying zip fallback"
+            curl -sL https://github.com/projectdiscovery/nuclei-templates/archive/refs/heads/master.zip -o /tmp/nuclei-templates.zip
+            unzip -q /tmp/nuclei-templates.zip -d /tmp || true
+            if [ -d /tmp/nuclei-templates-master ]; then
+              mv /tmp/nuclei-templates-master /tmp/nuclei-templates || true
+            fi
+          fi
+          if [ ! -d /tmp/nuclei-templates ] || [ -z "$(ls -A /tmp/nuclei-templates 2>/dev/null || true)" ]; then
+            echo "::error::nuclei templates not present after retries"
+            exit 1
+          fi
+          # ensure nuclei binary has latest template index
+          nuclei -update-templates || true
+          echo "[template fetch] done; templates count: $(find /tmp/nuclei-templates -type f | wc -l)"
 
       - name: Download top hosts
         uses: actions/download-artifact@v4
@@ -126,32 +165,48 @@ jobs:
           THREADS: ${{ github.event.inputs.httpx_threads }}
           RATE: ${{ github.event.inputs.nuclei_rate }}
           AGGR: ${{ github.event.inputs.aggressive }}
+          DO_DIRFUZZ: ${{ github.event.inputs.do_dirfuzz }}
         run: |
           set -euxo pipefail
-          mkdir -p outputs
+          mkdir -p outputs tmp/top_live_hosts
           for p in tmp/split/part.*; do
-            echo "[httpx] $p"
-            cat "$p" | httpx -silent -threads "$THREADS" -timeout 8 -ports 80,443 -status-code -title -json -o outputs/httpx.$(basename $p).jsonl || true
-            # build live hosts list from httpx JSONL
-            if [ -s outputs/httpx.$(basename $p).jsonl ]; then
-              jq -r '.host' outputs/httpx.$(basename $p).jsonl > tmp/top_live_hosts.$(basename $p).txt || true
+            partname="$(basename "$p")"
+            echo "=== chunk: $partname ==="
+            echo "[httpx] verifying live hosts from $p"
+            cat "$p" | httpx -silent -threads "$THREADS" -timeout 8 -ports 80,443 -status-code -title -json -o outputs/httpx.$partname.jsonl || true
+
+            if [ -s outputs/httpx.$partname.jsonl ]; then
+              jq -r '.host' outputs/httpx.$partname.jsonl > tmp/top_live_hosts.$partname.txt || true
             else
-              # if httpx returned nothing, fallback to original chunk
-              cp "$p" tmp/top_live_hosts.$(basename $p).txt || true
+              cp "$p" tmp/top_live_hosts.$partname.txt || true
             fi
 
-            # choose templates based on AGGR
+            # optional quick dir fuzz (tiny wordlist) to find admin pages / backups - ENABLE at your risk
+            if [ "${DO_DIRFUZZ:-false}" = "true" ] && command -v ffuf >/dev/null 2>&1; then
+              echo "[ffuf] quick dirfuzz on live hosts (tiny list)"
+              while read -r h; do
+                echo "https://$h/FUZZ" > /tmp/ffuf_target.$partname.txt
+                ffuf -w repo-wordlists/small-admin.txt -u "https://$h/FUZZ" -mc 200,301 -t 40 -o outputs/ffuf.$h.$partname.json || true
+              done < tmp/top_live_hosts.$partname.txt || true
+            fi
+
+            # template selection
             TEMPLATE_ARGS="-t /tmp/nuclei-templates/takeovers -t /tmp/nuclei-templates/exposures -t /tmp/nuclei-templates/misconfiguration"
-            if [ "$AGGR" = "true" ]; then
-              TEMPLATE_ARGS="$TEMPLATE_ARGS -t /tmp/nuclei-templates/vulnerabilities"
+            if [ "${AGGR}" = "true" ]; then
+              # aggressive: add vulnerability and cves templates (heavy)
+              TEMPLATE_ARGS="$TEMPLATE_ARGS -t /tmp/nuclei-templates/vulnerabilities -t /tmp/nuclei-templates/cves"
             fi
 
-            echo "[nuclei] running on live hosts $p"
-            if [ -s tmp/top_live_hosts.$(basename $p).txt ]; then
-              nuclei -l tmp/top_live_hosts.$(basename $p).txt $TEMPLATE_ARGS -severity medium,high,critical --rate-limit "$RATE" -jsonl -o outputs/nuclei.$(basename $p).jsonl || true
+            echo "[nuclei] running on live hosts $partname (templates: ${AGGR})"
+            if [ -s tmp/top_live_hosts.$partname.txt ]; then
+              # run nuclei; conservative JSONL output per part
+              nuclei -l tmp/top_live_hosts.$partname.txt $TEMPLATE_ARGS -severity medium,high,critical --rate-limit "$RATE" -jsonl -o outputs/nuclei.$partname.jsonl || true
             else
               echo "no live hosts in this chunk"
             fi
+
+            # small cooldown between chunks to avoid bursts
+            sleep 2
           done
 
       - name: Upload outputs
